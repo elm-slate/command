@@ -296,6 +296,9 @@ update config msg model =
         logMsg commandId message =
             config.logTagger ( LogLevelInfo, ( commandId, message ) )
 
+        debugMsg commandId message =
+            config.logTagger ( LogLevelDebug, ( commandId, message ) )
+
         nonFatal commandId error =
             config.errorTagger ( NonFatalError, ( commandId, error ) )
 
@@ -324,8 +327,11 @@ update config msg model =
                         LogLevelInfo ->
                             logMsg
 
+                        LogLevelDebug ->
+                            debugMsg
+
                         _ ->
-                            Debug.crash "Unexpected log level"
+                            Debug.crash ("Unexpected log level:" +-+ logLevel)
             in
                 ( model ! [], [ logHandler commandId (module_ ++ ":" +-+ message) ] )
 
@@ -360,7 +366,7 @@ update config msg model =
                         Dict.insert commandId (CommandState connectionId []) model.commandStates
                 in
                     ( { model | commandStates = commandStates } ! []
-                    , [ logMsg commandId ("PGConnect:" +-+ "Connection Id:" +-+ connectionId)
+                    , [ debugMsg commandId ("PGConnect:" +-+ "Connection Id:" +-+ connectionId)
                       , config.initCommandTagger commandId
                       ]
                     )

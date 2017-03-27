@@ -135,6 +135,9 @@ update config msg model =
         logMsg commandId message =
             config.logTagger ( LogLevelInfo, ( commandId, message ) )
 
+        debugMsg commandId message =
+            config.logTagger ( LogLevelDebug, ( commandId, message ) )
+
         nonFatal commandId error =
             config.errorTagger ( NonFatalError, ( commandId, error ) )
 
@@ -162,6 +165,9 @@ update config msg model =
                     case logLevel of
                         LogLevelInfo ->
                             logMsg
+
+                        LogLevelDebug ->
+                            debugMsg
 
                         _ ->
                             crash "Unexpected log level"
