@@ -476,13 +476,10 @@ update config msg model =
 
             RetryConnectCmd retryCount failureMsg cmd ->
                 let
-                    l =
-                        Debug.log "RetryConnectCmd" "got here"
-
                     parentMsg =
                         case failureMsg of
                             PGConnectError commandId ( _, error ) ->
-                                logMsg commandId <| Debug.log "here" ("initCommand Error:" +-+ "Connection Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
+                                logMsg commandId ("initCommand Error:" +-+ "Connection Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
 
                             _ ->
                                 Debug.crash "BUG -- Should never get here"
