@@ -230,7 +230,7 @@ type Msg
     | LockerModule Locker.Msg
     | ValidatorError ( ErrorType, ( CommandId, String ) )
     | ValidatorLog ( LogLevel, ( CommandId, String ) )
-    | ValidatorModule Validator.Msg
+    | ValidatorModule (Validator.Msg Msg)
     | RetryConnectCmd Int Msg (Cmd Msg)
     | RetryModule (Retry.Msg Msg)
 

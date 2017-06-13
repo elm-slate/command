@@ -12,6 +12,7 @@ module Slate.Command.Validator
         , outOfBoundsError
         )
 
+import Task
 import Set
 import Tuple exposing (..)
 import Dict exposing (Dict)
@@ -70,7 +71,7 @@ type SlateObject
 parent msg taggers
 -}
 type alias RouteToMeTagger msg =
-    Msg -> msg
+    Msg msg -> msg
 
 
 {-|
@@ -85,8 +86,8 @@ type alias Config msg =
     }
 
 
-type Msg
-    = Nop
+type Msg msg
+    = ParentMsg msg
     | QueryError CommandId ( ConnectionId, String )
     | QuerySuccess CommandId ( ConnectionId, List String )
 
@@ -96,12 +97,17 @@ type alias Model =
     }
 
 
-init : (Msg -> msg) -> ( Model, Cmd msg )
+init : (Msg msg -> msg) -> ( Model, Cmd msg )
 init tagger =
     ({ validations = Dict.empty } ! [])
 
 
-update : Config msg -> Msg -> Model -> ( ( Model, Cmd Msg ), List msg )
+msgToCmd : msg -> Cmd msg
+msgToCmd msg =
+    Task.perform identity <| Task.succeed msg
+
+
+update : Config msg -> Msg msg -> Model -> ( ( Model, Cmd (Msg msg) ), List msg )
 update config msg model =
     let
         logMsg commandId message =
@@ -114,8 +120,8 @@ update config msg model =
             config.errorTagger ( FatalError, ( commandId, error ) )
     in
         case msg of
-            Nop ->
-                ( model ! [], [] )
+            ParentMsg msg ->
+                ( model ! [], [ msg ] )
 
             QuerySuccess commandId ( connectionId, results ) ->
                 let
@@ -797,7 +803,10 @@ validate config model commandId connectionId entityValidationEvents =
             -- DebugF.log "sql" <|
             ((clauses == "") ? ( "", RegexU.replaceAll "{{clauses}}" clauses sqlTemplate ) ++ unionAll ++ (positioningClauses == "") ? ( "", RegexU.replaceAll "{{positioningClauses}}" positioningClauses positioningSqlTemplate ))
     in
-        ( { model | validations = Dict.insert commandId (ValidationState entityValidationEvents []) model.validations }, Cmd.map config.routeToMeTagger <| Postgres.query (QueryError commandId) (QuerySuccess commandId) connectionId sql batchSize )
+        (sql == "")
+            ? ( model ! [ Cmd.map config.routeToMeTagger <| msgToCmd <| ParentMsg <| config.validateEntitiesSuccessTagger commandId ]
+              , ( { model | validations = Dict.insert commandId (ValidationState entityValidationEvents []) model.validations }, Cmd.map config.routeToMeTagger <| Postgres.query (QueryError commandId) (QuerySuccess commandId) connectionId sql batchSize )
+              )
 
 
 
