@@ -1,5 +1,5 @@
 {
-    "version": "1.0.5",
+    "version": "2.0.0",
     "summary": "Slate command processing modules",
     "repository": "https://github.com/elm-slate/command.git",
     "license": "Unlicense",
@@ -14,6 +14,7 @@
     ],
     "dependencies": {
         "elm-lang/core": "5.0.0 <= v < 6.0.0",
+		"elm-community/maybe-extra": "4.0.0 <= v < 5.0.0",
         "skinney/fnv": "1.0.3 <= v < 2.0.0",
         "panosoft/elm-string-utils": "2.0.0 <= v < 3.0.0",
 		"panosoft/elm-utils": "2.0.0 <= v < 3.0.0",

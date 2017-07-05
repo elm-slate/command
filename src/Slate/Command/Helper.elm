@@ -26,6 +26,7 @@ import Json.Decode as JD exposing (..)
 import String exposing (join)
 import StringUtils exposing ((+-+), (+++))
 import Slate.Common.Entity exposing (..)
+import Slate.Common.Schema exposing (..)
 import Slate.Command.Locker as Locker exposing (..)
 import Slate.Command.Validator as Validator exposing (..)
 import Slate.Command.Common.Command exposing (..)
@@ -33,7 +34,7 @@ import Slate.Command.Common.Validation exposing (..)
 import Slate.Common.Db exposing (..)
 import Slate.Common.Event exposing (..)
 import Slate.Common.Taggers exposing (..)
-import Postgres exposing (..)
+import Postgres exposing (ConnectionId, QueryTagger, Sql)
 import ParentChildUpdate exposing (..)
 import Utils.Json exposing ((<||))
 import Utils.Ops exposing (..)
@@ -171,35 +172,42 @@ type alias Config msg =
     , rollbackTagger : RollbackTagger msg
     , rollbackErrorTagger : RollbackErrorTagger msg
     , connectionLostTagger : ConnectionLostTagger msg
+    , schemaDict : Dict EntityName EntitySchema
+    , queryBatchSize : Maybe Int
+    , debug : Bool
     }
 
 
 lockerConfig : Config msg -> Locker.Config Msg
 lockerConfig config =
     { retries = config.lockRetries ?= 10
-    , routeToMeTagger = LockerModule
+    , routeToMeTagger = LockerMsg
     , errorTagger = LockerError
     , logTagger = LockerLog
     , lockEntitiesSuccessTagger = LockEntitiesSuccess
     , lockEntitiesErrorTagger = LockEntitiesError
+    , debug = config.debug
     }
 
 
-validatorConfig : Validator.Config Msg
-validatorConfig =
-    { routeToMeTagger = ValidatorModule
+validatorConfig : Config msg -> Validator.Config Msg
+validatorConfig config =
+    { routeToMeTagger = ValidatorMsg
     , errorTagger = ValidatorError
     , logTagger = ValidatorLog
     , validateEntitiesSuccessTagger = ValidationEntitiesSuccess
     , validateEntitiesErrorTagger = ValidationEntitiesError
+    , schemaDict = config.schemaDict
+    , queryBatchSize = config.queryBatchSize
+    , debug = config.debug
     }
 
 
-retryConfig : Config msg -> Retry.Config Msg
-retryConfig config =
+retryConfig : Config msg -> CommandId -> Retry.Config Msg
+retryConfig config commandId =
     { retryMax = config.retryMax ?= 10
     , delayNext = config.delayNext ?= Retry.constantDelay 5000
-    , routeToMeTagger = RetryModule
+    , routeToMeTagger = RetryMsg commandId
     }
 
 
@@ -227,12 +235,12 @@ type Msg
     | WriteEventsError CommandId String ( ConnectionId, String )
     | LockerError ( ErrorType, ( CommandId, String ) )
     | LockerLog ( LogLevel, ( CommandId, String ) )
-    | LockerModule Locker.Msg
+    | LockerMsg Locker.Msg
     | ValidatorError ( ErrorType, ( CommandId, String ) )
     | ValidatorLog ( LogLevel, ( CommandId, String ) )
-    | ValidatorModule (Validator.Msg Msg)
+    | ValidatorMsg (Validator.Msg Msg)
     | RetryConnectCmd Int Msg (Cmd Msg)
-    | RetryModule (Retry.Msg Msg)
+    | RetryMsg CommandId (Retry.Msg Msg)
 
 
 {-|
@@ -243,7 +251,7 @@ type alias Model =
     , nextCommandId : CommandId
     , lockerModel : Locker.Model
     , validatorModel : Validator.Model
-    , retryModel : Retry.Model Msg
+    , retryModels : Dict CommandId (Retry.Model Msg)
     }
 
 
@@ -251,16 +259,16 @@ initModel : ( Model, List (Cmd Msg) )
 initModel =
     let
         ( lockerModel, lockerCmd ) =
-            Locker.init LockerModule
+            Locker.init LockerMsg
 
         ( validatorModel, validatorCmd ) =
-            Validator.init ValidatorModule
+            Validator.init ValidatorMsg
     in
         ( { commandStates = Dict.empty
           , nextCommandId = 0
           , lockerModel = lockerModel
           , validatorModel = validatorModel
-          , retryModel = Retry.initModel
+          , retryModels = Dict.empty
           }
         , [ lockerCmd, validatorCmd ]
         )
@@ -345,16 +353,18 @@ update config msg model =
             disconnectCommon True
 
         updateLocker =
-            ParentChildUpdate.updateChildParent (Locker.update <| lockerConfig config) (update config) .lockerModel LockerModule (\model lockerModel -> { model | lockerModel = lockerModel })
+            ParentChildUpdate.updateChildParent (Locker.update <| lockerConfig config) (update config) .lockerModel LockerMsg (\model lockerModel -> { model | lockerModel = lockerModel })
 
         updateValidator =
-            ParentChildUpdate.updateChildParent (Validator.update validatorConfig) (update config) .validatorModel ValidatorModule (\model validatorModel -> { model | validatorModel = validatorModel })
+            ParentChildUpdate.updateChildParent (Validator.update (validatorConfig config)) (update config) .validatorModel ValidatorMsg (\model validatorModel -> { model | validatorModel = validatorModel })
 
-        retryCfg =
-            retryConfig config
+        getRetryModel config model commandId =
+            Dict.get commandId model.retryModels
+                ?!= (\_ -> Debug.crash ("BUG: Cannot find retry model for commandId:" +-+ commandId))
 
-        updateRetry =
-            ParentChildUpdate.updateChildParent (Retry.update retryCfg) (update config) .retryModel retryCfg.routeToMeTagger (\model retryModel -> { model | retryModel = retryModel })
+        updateRetry commandId =
+            retryConfig config commandId
+                |> (\retryConfig -> ParentChildUpdate.updateChildParent (Retry.update retryConfig) (update config) (\model -> getRetryModel config model commandId) retryConfig.routeToMeTagger (\model retryModel -> { model | retryModels = Dict.insert commandId retryModel model.retryModels }))
     in
         case msg of
             Nop ->
@@ -365,14 +375,18 @@ update config msg model =
                     commandStates =
                         Dict.insert commandId (CommandState connectionId []) model.commandStates
                 in
-                    ( { model | commandStates = commandStates } ! []
-                    , [ debugMsg commandId ("PGConnect:" +-+ "Connection Id:" +-+ connectionId)
-                      , config.initCommandTagger commandId
-                      ]
-                    )
+                    { model | retryModels = Dict.remove commandId model.retryModels }
+                        |> (\model ->
+                                ( { model | commandStates = commandStates } ! []
+                                , [ debugMsg commandId ("PGConnect:" +-+ "Connection Id:" +-+ connectionId)
+                                  , config.initCommandTagger commandId
+                                  ]
+                                )
+                           )
 
             PGConnectError commandId ( _, error ) ->
-                ( model ! [], [ config.initCommandErrorTagger ( commandId, error ) ] )
+                { model | retryModels = Dict.remove commandId model.retryModels }
+                    |> (\model -> ( model ! [], [ config.initCommandErrorTagger ( commandId, error ) ] ))
 
             PGConnectionLost commandId ( connectionId, error ) ->
                 ( removeCommandState commandId model ! []
@@ -408,7 +422,7 @@ update config msg model =
                                 []
 
                     ( validatorModel, cmd ) =
-                        Validator.validate validatorConfig model.validatorModel commandId commandState.connectionId entityValidations
+                        Validator.validate (validatorConfig config) model.validatorModel commandId commandState.connectionId entityValidations
                 in
                     ( { model | validatorModel = validatorModel } ! [ cmd ], [] )
 
@@ -424,7 +438,7 @@ update config msg model =
             Begin commandId statement ( connectionId, results ) ->
                 let
                     cmd =
-                        Postgres.query (WriteEventsError commandId statement) (WriteEvents commandId statement) connectionId statement 2
+                        query commandId (WriteEventsError commandId statement) (WriteEvents commandId statement) connectionId statement 2
                 in
                     ( model ! [ cmd ], [] )
 
@@ -468,7 +482,7 @@ update config msg model =
             LockerLog logInfo ->
                 childLog "Locker" logInfo
 
-            LockerModule msg ->
+            LockerMsg msg ->
                 updateLocker msg model
 
             ValidatorError error ->
@@ -477,7 +491,7 @@ update config msg model =
             ValidatorLog logInfo ->
                 childLog "Validator" logInfo
 
-            ValidatorModule msg ->
+            ValidatorMsg msg ->
                 updateValidator msg model
 
             RetryConnectCmd retryCount failureMsg cmd ->
@@ -492,8 +506,8 @@ update config msg model =
                 in
                     ( model ! [ cmd ], [ parentMsg ] )
 
-            RetryModule msg ->
-                updateRetry msg model
+            RetryMsg commandId msg ->
+                updateRetry commandId msg model
 
 
 
@@ -510,9 +524,9 @@ initCommand config dbConnectionInfo model =
             model.nextCommandId
 
         ( retryModel, retryCmd ) =
-            Retry.retry (retryConfig config) model.retryModel (PGConnectError commandId) RetryConnectCmd (connectCmd dbConnectionInfo commandId)
+            Retry.retry (retryConfig config commandId) Retry.initModel (PGConnectError commandId) RetryConnectCmd (connectCmd dbConnectionInfo commandId)
     in
-        ( { model | retryModel = retryModel, nextCommandId = model.nextCommandId + 1 }
+        ( { model | retryModels = Dict.insert commandId retryModel model.retryModels, nextCommandId = model.nextCommandId + 1 }
         , Cmd.map config.routeToMeTagger <| retryCmd
         , commandId
         )
@@ -551,7 +565,7 @@ writeEvents config model commandId events =
                 statement =
                     insertEventsStatement events
             in
-                Cmd.map config.routeToMeTagger <| Postgres.query (BeginError commandId statement) (Begin commandId statement) connectionId "BEGIN" 1
+                Cmd.map config.routeToMeTagger <| query commandId (BeginError commandId statement) (Begin commandId statement) connectionId "BEGIN" 1
     in
         Dict.get commandId model.commandStates
             |?> (\commandState -> Ok ( model, (writeEventsCmd commandId commandState.connectionId events) ))
@@ -564,7 +578,7 @@ writeEvents config model commandId events =
 commit : Config msg -> Model -> CommandId -> Result String ( Model, Cmd msg )
 commit config model commandId =
     Dict.get commandId model.commandStates
-        |?> (\commandState -> Ok ( model, (Cmd.map config.routeToMeTagger <| Postgres.query (CommitError commandId) (Commit commandId) commandState.connectionId "COMMIT" 1) ))
+        |?> (\commandState -> Ok ( model, (Cmd.map config.routeToMeTagger <| query commandId (CommitError commandId) (Commit commandId) commandState.connectionId "COMMIT" 1) ))
         ?= badCommandId commandId
 
 
@@ -574,7 +588,7 @@ commit config model commandId =
 rollback : Config msg -> Model -> CommandId -> Result String ( Model, Cmd msg )
 rollback config model commandId =
     Dict.get commandId model.commandStates
-        |?> (\commandState -> Ok ( model, (Cmd.map config.routeToMeTagger <| Postgres.query (RollbackError commandId) (Rollback commandId) commandState.connectionId "ROLLBACK" 1) ))
+        |?> (\commandState -> Ok ( model, (Cmd.map config.routeToMeTagger <| query commandId (RollbackError commandId) (Rollback commandId) commandState.connectionId "ROLLBACK" 1) ))
         ?= badCommandId commandId
 
 
@@ -652,3 +666,8 @@ connectCmd dbConnectionInfo commandId failureTagger =
         dbConnectionInfo.database
         dbConnectionInfo.user
         dbConnectionInfo.password
+
+
+query : CommandId -> Postgres.ErrorTagger msg -> QueryTagger msg -> ConnectionId -> Sql -> Int -> Cmd msg
+query commandId errorTagger queryTagger connectionId sql =
+    Postgres.query errorTagger queryTagger connectionId ("-- Validator:: (CommandId, ConnectionId):" +-+ ( commandId, connectionId ) ++ "\n" ++ sql)

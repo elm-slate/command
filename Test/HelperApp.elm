@@ -4,7 +4,7 @@ import Platform
 import Time exposing (Time, second)
 import Process
 import Task exposing (Task)
-import Json.Encode as JE
+import Dict
 import StringUtils exposing ((+-+), (+++))
 import Slate.Command.Helper as CommandHelper exposing (EntityLockAndValidation(..))
 import Slate.Command.Common.Command exposing (..)
@@ -50,7 +50,7 @@ commandHelperConfig =
     { retryMax = Nothing
     , delayNext = Nothing
     , lockRetries = Nothing
-    , routeToMeTagger = CommandHelperModule
+    , routeToMeTagger = CommandHelperMsg
     , errorTagger = CommandHelperError
     , logTagger = CommandHelperLog
     , initCommandTagger = InitCommand
@@ -65,6 +65,9 @@ commandHelperConfig =
     , rollbackTagger = Rollback
     , rollbackErrorTagger = RollbackError
     , connectionLostTagger = ConnectionLost
+    , schemaDict = Dict.empty
+    , queryBatchSize = Nothing
+    , debug = True
     }
 
 
@@ -131,17 +134,17 @@ type Msg
     | Rollback CommandId
     | RollbackError ( CommandId, String )
     | ConnectionLost ( CommandId, String )
-    | CommandHelperModule CommandHelper.Msg
+    | CommandHelperMsg CommandHelper.Msg
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     let
         makeEvent mutatingEvent =
-            Mutating mutatingEvent 0 (Metadata "initiator" "command")
+            Mutating mutatingEvent (Metadata "initiator" "command")
 
         updateCommandHelper =
-            ParentChildUpdate.updateChildApp (CommandHelper.update commandHelperConfig) update .commandHelperModel CommandHelperModule (\model commandHelperModel -> { model | commandHelperModel = commandHelperModel })
+            ParentChildUpdate.updateChildApp (CommandHelper.update commandHelperConfig) update .commandHelperModel CommandHelperMsg (\model commandHelperModel -> { model | commandHelperModel = commandHelperModel })
     in
         case msg of
             Nop ->
@@ -187,7 +190,7 @@ update msg model =
                     ( commandHelperModel, cmd ) =
                         let
                             lockAndValidateEvent mutatingEvent =
-                                LockAndValidate << ValidateForMutation <| Mutating mutatingEvent 0 (Metadata "initiator" "command")
+                                LockAndValidate << ValidateForMutation <| Mutating mutatingEvent (Metadata "initiator" "command")
                         in
                             CommandHelper.lockAndValidateEntities commandHelperConfig model.commandHelperModel commandId [ lockAndValidateEvent <| CreateEntity "entityName" entityId1, lockAndValidateEvent <| CreateEntity "entityName" entityId2 ]
                                 ??= (\err ->
@@ -209,8 +212,8 @@ update msg model =
                         Debug.log "lockAndValidateEntities Complete" ("Command Id:  " +-+ commandId)
 
                     events =
-                        [ encodeMutatingEvent <| makeEvent <| CreateEntity "entityName" entityId1
-                        , encodeMutatingEvent <| makeEvent <| CreateEntity "entityName" entityId2
+                        [ encodeEvent <| makeEvent <| CreateEntity "entityName" entityId1
+                        , encodeEvent <| makeEvent <| CreateEntity "entityName" entityId2
                           -- encodeEvent "User Created" entityId1 "Create User" "64194fcb-bf87-40c2-bee7-3a86f0110840"
                           -- , encodeEvent "User Created" entityId2 "Create User" "d2a1cf24-dc3a-45d6-8310-1fb6eb184d1b"
                         ]
@@ -312,20 +315,10 @@ update msg model =
                 in
                     ( model, delayCmd (exitApp 1) (1 * second) )
 
-            CommandHelperModule msg ->
+            CommandHelperMsg msg ->
                 updateCommandHelper msg model
 
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
     Sub.none
-
-
-encodeEvent : String -> String -> String -> String -> String
-encodeEvent name entityId command initiatorId =
-    JE.encode 0 <|
-        JE.object
-            [ ( "name", JE.string name )
-            , ( "data", JE.object [ ( "entityId", JE.string entityId ) ] )
-            , ( "metadata", JE.object [ ( "command", JE.string command ), ( "initiatorId", JE.string initiatorId ) ] )
-            ]

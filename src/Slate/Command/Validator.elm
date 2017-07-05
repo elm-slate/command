@@ -10,6 +10,7 @@ module Slate.Command.Validator
         , alreadyExistsError
         , doesNotExistError
         , outOfBoundsError
+        , invalidValueChange
         )
 
 import Task
@@ -17,25 +18,28 @@ import Set
 import Tuple exposing (..)
 import Dict exposing (Dict)
 import Json.Decode as JD exposing (field)
+import Maybe.Extra as Maybe
 import StringUtils exposing (..)
 import Utils.Error exposing (..)
 import Utils.Ops exposing (..)
+import Utils.Func exposing (..)
 import Utils.Json exposing (..)
 import Utils.Log exposing (..)
 import Utils.Regex as RegexU
 import Slate.Common.Taggers exposing (..)
+import Slate.Common.Schema exposing (..)
 import Slate.Common.Entity exposing (..)
-import Slate.Common.Event exposing (..)
+import Slate.Common.Event as Event exposing (..)
 import Slate.Command.Common.Command exposing (..)
 import Slate.Command.Common.Validation exposing (..)
-import Postgres exposing (..)
+import Postgres exposing (ConnectionId, QueryTagger, Sql)
 
 
 -- import DebugF
 
 
-batchSize : Int
-batchSize =
+defaultQueryBatchSize : Int
+defaultQueryBatchSize =
     1000
 
 
@@ -46,6 +50,7 @@ type alias ValidationQueryResult =
     , operation : String
     , propertyName : Maybe String
     , propertyId : Maybe String
+    , value : Maybe String
     }
 
 
@@ -83,6 +88,9 @@ type alias Config msg =
     , logTagger : LogTagger ( CommandId, String ) msg
     , validateEntitiesSuccessTagger : EntityValidationSuccessTagger msg
     , validateEntitiesErrorTagger : EntityValidationErrorTagger msg
+    , schemaDict : Dict EntityName EntitySchema
+    , queryBatchSize : Maybe Int
+    , debug : Bool
     }
 
 
@@ -118,6 +126,9 @@ update config msg model =
 
         fatal commandId error =
             config.errorTagger ( FatalError, ( commandId, error ) )
+
+        getPropertyName =
+            Event.getPropertyName
     in
         case msg of
             ParentMsg msg ->
@@ -138,7 +149,7 @@ update config msg model =
                                     crash =
                                         Debug.crash ("Validation query decoding error:" +-+ error ++ "\non:" +-+ resultStr)
                                 in
-                                    ValidationQueryResult "" "" "" "" Nothing Nothing
+                                    ValidationQueryResult "" "" "" "" Nothing Nothing Nothing
 
                             queryResultSet =
                                 List.map (\resultStr -> JD.decodeString validationQueryDecoder resultStr ??= decodeCrash currentResults) currentResults
@@ -184,6 +195,26 @@ update config msg model =
                             propertyExists entityId propertyName result =
                                 result.type_ == "existence" && result.operation == "added" && result.entityId == entityId && result.target == "property" && result.propertyName == Just propertyName && result.propertyId == Nothing
 
+                            getLastPropertyValue : List SlateObject -> List SlateObject -> List ( PropertyName, Value ) -> Event -> Maybe Value
+                            getLastPropertyValue nowExists noLongerExists nowPropertyValues event =
+                                (first <| doesPropertyExist nowExists noLongerExists event)
+                                    ? ( ( getEntityId event ??= crash, getPropertyName event ??= crash )
+                                            |> (\( entityId, propertyName ) ->
+                                                    (queryResultSet
+                                                        |> List.filter (propertyExists entityId propertyName)
+                                                        |> List.filterMap .value
+                                                        |> List.head
+                                                    )
+                                                        |> (\maybeValueInDb ->
+                                                                nowPropertyValues
+                                                                    |> List.foldr (\( nowPropertyName, nowValue ) maybeLastValue -> (nowPropertyName == propertyName) ? ( Just nowValue, maybeLastValue )) Nothing
+                                                                    |> (\maybeLastValueNow -> Maybe.or maybeLastValueNow maybeValueInDb)
+                                                           )
+                                               )
+                                      , Nothing
+                                      )
+
+                            doesPropertyExist : List SlateObject -> List SlateObject -> Event -> ( Bool, SlateObject )
                             doesPropertyExist nowExists noLongerExists event =
                                 let
                                     entityId =
@@ -350,7 +381,7 @@ update config msg model =
                                 in
                                     oldPosition < count && newPosition < count && oldPosition >= 0 && newPosition >= 0
 
-                            validateEvent validationEvent ( nowExists, noLongerExists, errors ) =
+                            validateEvent validationEvent ( nowExists, noLongerExists, errors, nowPropertyValues ) =
                                 case validationEvent of
                                     ValidateForMutation event ->
                                         case event of
@@ -373,10 +404,10 @@ update config msg model =
                                                                     didEntityUseToExist nowExists noLongerExists event
                                                             in
                                                                 exists
-                                                                    ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "entity" ) :: errors )
+                                                                    ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "entity" ) :: errors, nowPropertyValues )
                                                                       , existed
-                                                                            ? ( ( nowExists, noLongerExists, ( event, entityNoLongerExistsError ) :: errors )
-                                                                              , ( slateObject :: nowExists, noLongerExists, errors )
+                                                                            ? ( ( nowExists, noLongerExists, ( event, entityNoLongerExistsError ) :: errors, nowPropertyValues )
+                                                                              , ( slateObject :: nowExists, noLongerExists, errors, nowPropertyValues )
                                                                               )
                                                                       )
 
@@ -386,14 +417,27 @@ update config msg model =
                                                                     doesEntityExist nowExists noLongerExists event
                                                             in
                                                                 exists
-                                                                    ? ( ( nowExists, slateObject :: noLongerExists, errors )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                    ? ( ( nowExists, slateObject :: noLongerExists, errors, nowPropertyValues )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
-                                                        AddProperty _ entityId propertyName _ ->
+                                                        AddProperty entityName entityId propertyName value ->
                                                             entityExists entityId
-                                                                ? ( ( Property entityId propertyName :: nowExists, noLongerExists, errors )
-                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                ? ( Dict.get entityName config.schemaDict
+                                                                        |?> (\entitySchema ->
+                                                                                getPropertySchema entitySchema propertyName
+                                                                                    |?> (\schema ->
+                                                                                            getLastPropertyValue nowExists noLongerExists nowPropertyValues event
+                                                                                                |> (\maybeOldValue ->
+                                                                                                        (getChangeValidator schema |?> apply2 maybeOldValue value ?= Ok ())
+                                                                                                            |??> (\_ -> ( Property entityId propertyName :: nowExists, noLongerExists, errors, ( propertyName, value ) :: nowPropertyValues ))
+                                                                                                            ??= (\error -> ( nowExists, noLongerExists, ( event, invalidValueChange maybeOldValue value error ) :: errors, nowPropertyValues ))
+                                                                                                   )
+                                                                                        )
+                                                                                    ?!= (\_ -> Debug.crash ("BUG: Cannot find schema for entity:" +-+ entityName +-+ "for property:" +-+ propertyName))
+                                                                            )
+                                                                        ?!= (\_ -> Debug.crash ("BUG: Missing schema in validator config for entity:" +-+ entityName +-+ "for property:" +-+ propertyName))
+                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                   )
 
                                                         RemoveProperty _ entityId propertyName ->
@@ -403,10 +447,10 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors )
-                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "property" ) :: errors )
+                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors, nowPropertyValues )
+                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "property" ) :: errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         AddPropertyList _ entityId propertyName propertyId _ ->
@@ -416,10 +460,10 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "property item" ) :: errors )
-                                                                              , ( slateObject :: nowExists, noLongerExists, errors )
+                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "property item" ) :: errors, nowPropertyValues )
+                                                                              , ( slateObject :: nowExists, noLongerExists, errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         RemovePropertyList _ entityId propertyName propertyId ->
@@ -429,19 +473,19 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors )
-                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "property item" ) :: errors )
+                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors, nowPropertyValues )
+                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "property item" ) :: errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         PositionPropertyList _ entityId _ _ ->
                                                             entityExists entityId
                                                                 ? ( isPropertyItemInBounds nowExists noLongerExists event
-                                                                        ? ( ( nowExists, noLongerExists, errors )
-                                                                          , ( nowExists, noLongerExists, ( event, outOfBoundsError "property" ) :: errors )
+                                                                        ? ( ( nowExists, noLongerExists, errors, nowPropertyValues )
+                                                                          , ( nowExists, noLongerExists, ( event, outOfBoundsError "property" ) :: errors, nowPropertyValues )
                                                                           )
-                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                   )
 
                                                         AddRelationship _ entityId propertyName _ ->
@@ -451,10 +495,10 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "relationship" ) :: errors )
-                                                                              , ( slateObject :: nowExists, noLongerExists, errors )
+                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "relationship" ) :: errors, nowPropertyValues )
+                                                                              , ( slateObject :: nowExists, noLongerExists, errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         RemoveRelationship _ entityId _ ->
@@ -464,10 +508,10 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors )
-                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "relationship" ) :: errors )
+                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors, nowPropertyValues )
+                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "relationship" ) :: errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         AddRelationshipList _ entityId _ propertyId _ ->
@@ -477,10 +521,10 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "relationship item" ) :: errors )
-                                                                              , ( slateObject :: nowExists, noLongerExists, errors )
+                                                                            ? ( ( nowExists, noLongerExists, ( event, alreadyExistsError "relationship item" ) :: errors, nowPropertyValues )
+                                                                              , ( slateObject :: nowExists, noLongerExists, errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         RemoveRelationshipList _ entityId _ propertyId ->
@@ -490,23 +534,23 @@ update config msg model =
                                                             in
                                                                 entityExists entityId
                                                                     ? ( exists
-                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors )
-                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "relationship item" ) :: errors )
+                                                                            ? ( ( nowExists, slateObject :: noLongerExists, errors, nowPropertyValues )
+                                                                              , ( nowExists, noLongerExists, ( event, doesNotExistError "relationship item" ) :: errors, nowPropertyValues )
                                                                               )
-                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                      , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                       )
 
                                                         PositionRelationshipList _ entityId _ _ ->
                                                             entityExists entityId
                                                                 ? ( isRelationshipItemInBounds nowExists noLongerExists event
-                                                                        ? ( ( nowExists, noLongerExists, errors )
-                                                                          , ( nowExists, noLongerExists, ( event, outOfBoundsError "relationship" ) :: errors )
+                                                                        ? ( ( nowExists, noLongerExists, errors, nowPropertyValues )
+                                                                          , ( nowExists, noLongerExists, ( event, outOfBoundsError "relationship" ) :: errors, nowPropertyValues )
                                                                           )
-                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                                   )
 
                                             NonMutating _ _ ->
-                                                ( nowExists, noLongerExists, errors )
+                                                ( nowExists, noLongerExists, errors, nowPropertyValues )
 
                                     ValidateExistence entityId ->
                                         let
@@ -517,18 +561,18 @@ update config msg model =
                                                 doesEntityExist nowExists noLongerExists event
                                         in
                                             exists
-                                                ? ( ( nowExists, noLongerExists, errors )
-                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors )
+                                                ? ( ( nowExists, noLongerExists, errors, nowPropertyValues )
+                                                  , ( nowExists, noLongerExists, ( event, doesNotExistError "entity" ) :: errors, nowPropertyValues )
                                                   )
 
-                            ( _, _, validationErrors ) =
+                            ( _, _, validationErrors, _ ) =
                                 validationState.entityValidationEvents
-                                    |> List.foldl validateEvent ( [], [], [] )
+                                    |> List.foldl validateEvent ( [], [], [], [] )
 
                             validationResultMsg =
                                 (validationErrors == []) ? ( config.validateEntitiesSuccessTagger commandId, config.validateEntitiesErrorTagger ( commandId, List.reverse validationErrors ) )
                         in
-                            ( ( model, Cmd.none ), [ validationResultMsg ] )
+                            ( ( { model | validations = Dict.remove commandId model.validations }, Cmd.none ), [ validationResultMsg ] )
 
                     getMore =
                         ( ( { model | validations = Dict.insert commandId { validationState | results = currentResults } model.validations }
@@ -537,7 +581,7 @@ update config msg model =
                         , []
                         )
                 in
-                    (List.length results /= batchSize)
+                    (List.length results /= (config.queryBatchSize ?= defaultQueryBatchSize))
                         ? ( doValidation
                           , getMore
                           )
@@ -568,6 +612,11 @@ doesNotExistError object =
 outOfBoundsError : String -> String
 outOfBoundsError object =
     object +-+ "out of bounds"
+
+
+invalidValueChange : Maybe Value -> Value -> String -> String
+invalidValueChange oldValue newValue reason =
+    "property change from:" +-+ oldValue +-+ "to" +-+ newValue +-+ "is invalid (reason:" +-+ reason ++ ")"
 
 
 validate : Config msg -> Model -> CommandId -> ConnectionId -> List ValidationEvent -> ( Model, Cmd msg )
@@ -639,16 +688,17 @@ validate config model commandId connectionId entityValidationEvents =
 
         sqlTemplate =
             """
-                SELECT 'existence' AS "type", "entityId", "target", "propertyName", "operation", "propertyId"
+                SELECT 'existence' AS "type", "entityId", "target", "propertyName", "operation", "propertyId", "value"
                 FROM (
-                    SELECT "entityId", "target", "propertyName", "operation", "propertyId", RANK() OVER (PARTITION BY "entityId", "target", "propertyName", "propertyId" ORDER BY id DESC) as _rank
+                    SELECT "entityId", "target", "propertyName", "operation", "propertyId", "value", RANK() OVER (PARTITION BY "entityId", "target", "propertyName", "propertyId" ORDER BY id DESC) as _rank
                     FROM (
                         SELECT  id,
                                 event#>>'{entityId}' AS "entityId",
                                 event#>>'{target}' AS "target",
                                 event#>>'{operation}' AS "operation",
                                 event#>>'{propertyName}' AS "propertyName",
-                                event#>>'{propertyId}' AS "propertyId"
+                                event#>>'{propertyId}' AS "propertyId",
+                                event#>>'{value}' AS "value"
                         FROM events
                         WHERE 1!=1
                             {{clauses}}
@@ -740,8 +790,8 @@ validate config model commandId connectionId entityValidationEvents =
                                     DestroyEntity _ entityId ->
                                         [ buildEntityTemplate entityId ]
 
-                                    AddProperty _ entityId _ _ ->
-                                        [ buildEntityTemplate entityId ]
+                                    AddProperty _ entityId propertyName _ ->
+                                        [ buildEntityTemplate entityId, buildPropertyTemplate entityId propertyName ]
 
                                     RemoveProperty _ entityId propertyName ->
                                         [ buildEntityTemplate entityId, buildPropertyTemplate entityId propertyName ]
@@ -805,12 +855,17 @@ validate config model commandId connectionId entityValidationEvents =
     in
         (sql == "")
             ? ( model ! [ Cmd.map config.routeToMeTagger <| msgToCmd <| ParentMsg <| config.validateEntitiesSuccessTagger commandId ]
-              , ( { model | validations = Dict.insert commandId (ValidationState entityValidationEvents []) model.validations }, Cmd.map config.routeToMeTagger <| Postgres.query (QueryError commandId) (QuerySuccess commandId) connectionId sql batchSize )
+              , ( { model | validations = Dict.insert commandId (ValidationState entityValidationEvents []) model.validations }, Cmd.map config.routeToMeTagger <| query commandId (QueryError commandId) (QuerySuccess commandId) connectionId sql (config.queryBatchSize ?= defaultQueryBatchSize) )
               )
 
 
 
 -- PRIVATE API
+
+
+query : CommandId -> Postgres.ErrorTagger msg -> QueryTagger msg -> ConnectionId -> Sql -> Int -> Cmd msg
+query commandId errorTagger queryTagger connectionId sql =
+    Postgres.query errorTagger queryTagger connectionId ("-- Validator:: (CommandId, ConnectionId):" +-+ ( commandId, connectionId ) ++ "\n" ++ sql)
 
 
 validationQueryDecoder : JD.Decoder ValidationQueryResult
@@ -822,3 +877,4 @@ validationQueryDecoder =
         <|| (field "operation" JD.string)
         <|| (JD.maybe <| field "propertyName" JD.string)
         <|| (JD.maybe <| field "propertyId" JD.string)
+        <|| (JD.maybe <| field "value" JD.string)

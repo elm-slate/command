@@ -28,16 +28,18 @@ import Utils.Error exposing (..)
 import Utils.Log exposing (..)
 import Slate.Common.Db exposing (..)
 import Slate.Common.Event exposing (..)
+import Slate.Common.Entity exposing (..)
+import Slate.Common.Schema exposing (..)
 import Slate.Common.Taggers exposing (..)
 import DebugF exposing (..)
 
 
-commandHelperConfig : CommandHelper.Config (Msg customValidationError)
-commandHelperConfig =
-    { retryMax = Nothing
+commandHelperConfig : Config customValidationError msg -> CommandHelper.Config (Msg customValidationError)
+commandHelperConfig config =
+    { retryMax = Just config.connectionRetryMax
     , delayNext = Nothing
     , lockRetries = Nothing
-    , routeToMeTagger = CommandHelperModule
+    , routeToMeTagger = CommandHelperMsg
     , errorTagger = CommandHelperError
     , logTagger = CommandHelperLog
     , initCommandTagger = InitCommandSuccess
@@ -52,6 +54,9 @@ commandHelperConfig =
     , rollbackTagger = RollbackSuccess
     , rollbackErrorTagger = RollbackError
     , connectionLostTagger = ConnectionLost
+    , schemaDict = config.schemaDict
+    , queryBatchSize = config.queryBatchSize
+    , debug = config.debug
     }
 
 
@@ -78,6 +83,22 @@ type CommandError customValidationError
 
 
 {-|
+    Command Processor's Config
+-}
+type alias Config customValidationError msg =
+    { connectionRetryMax : Int
+    , routeToMeTagger : RouteToMeTagger customValidationError msg
+    , errorTagger : ErrorTagger ( CommandId, String ) msg
+    , logTagger : LogTagger ( CommandId, String ) msg
+    , commandErrorTagger : CommandErrorTagger customValidationError msg
+    , commandSuccessTagger : CommandSuccessTagger msg
+    , schemaDict : Dict EntityName EntitySchema
+    , queryBatchSize : Maybe Int
+    , debug : Bool
+    }
+
+
+{-|
     Command Processor's Model
 -}
 type alias Model customValidationError msg =
@@ -86,11 +107,11 @@ type alias Model customValidationError msg =
     }
 
 
-initModel : ( Model customValidationError msg, List (Cmd (Msg customValidationError)) )
-initModel =
+initModel : Config customValidationError msg -> ( Model customValidationError msg, List (Cmd (Msg customValidationError)) )
+initModel config =
     let
         ( commandHelperModel, commandHelperCmds ) =
-            CommandHelper.init commandHelperConfig
+            CommandHelper.init (commandHelperConfig config)
     in
         ( { commandHelperModel = commandHelperModel
           , commandStates = Dict.empty
@@ -120,7 +141,7 @@ type Msg customValidationError
     | ValidationError ( CommandId, customValidationError )
     | CommandHelperError ( ErrorType, ( CommandId, String ) )
     | CommandHelperLog ( LogLevel, ( CommandId, String ) )
-    | CommandHelperModule CommandHelper.Msg
+    | CommandHelperMsg CommandHelper.Msg
 
 
 {-|
@@ -202,7 +223,7 @@ update config msg model =
         helperFailed model commandId originalError =
             let
                 ( ( commandHelperModel, cmd ), msgs ) =
-                    CommandHelper.rollback commandHelperConfig model.commandHelperModel commandId
+                    CommandHelper.rollback (commandHelperConfig config) model.commandHelperModel commandId
                         |??> (\( commandHelperModel, cmd ) -> ( { model | commandHelperModel = commandHelperModel } ! [ cmd ], [] ))
                         ??= (\rollbackError -> rollbackLessFailure model commandId (Just rollbackError) originalError)
 
@@ -228,7 +249,7 @@ update config msg model =
                 commandState.commandError ?!= (\_ -> crash ("No Command Error for commandState:" +-+ commandState))
 
         updateCommandHelper =
-            updateChildParent (CommandHelper.update commandHelperConfig) (update config) .commandHelperModel CommandHelperModule (\model commandHelperModel -> { model | commandHelperModel = commandHelperModel })
+            updateChildParent (CommandHelper.update (commandHelperConfig config)) (update config) .commandHelperModel CommandHelperMsg (\model commandHelperModel -> { model | commandHelperModel = commandHelperModel })
     in
         case msg of
             Nop ->
@@ -361,7 +382,7 @@ update config msg model =
                     errorCrash =
                         (errors /= []) ?! ( (\_ -> crash <| "Invalid Entity Operations\n    " ++ (String.join "\n    " errors) +-+ "\n    " ++ crashInfo ++ "\n"), identity )
                 in
-                    CommandHelper.lockAndValidateEntities commandHelperConfig model.commandHelperModel commandId (getEntityLockAndValidations commandId)
+                    CommandHelper.lockAndValidateEntities (commandHelperConfig config) model.commandHelperModel commandId (getEntityLockAndValidations commandId)
                         |> helperResults model commandId
 
             InitCommandError ( commandId, error ) ->
@@ -387,7 +408,7 @@ update config msg model =
                 helperFailed model commandId <| EntityValidationCommandError errors
 
             WriteEventsSuccess ( commandId, eventRows ) ->
-                CommandHelper.commit commandHelperConfig model.commandHelperModel commandId
+                CommandHelper.commit (commandHelperConfig config) model.commandHelperModel commandId
                     |> helperResults model commandId
 
             WriteEventsError ( commandId, error ) ->
@@ -409,7 +430,7 @@ update config msg model =
                 rollbackLessFailure model commandId Nothing <| OperationalCommandError error
 
             ValidationSuccess commandId ->
-                CommandHelper.writeEvents commandHelperConfig model.commandHelperModel commandId (events commandId)
+                CommandHelper.writeEvents (commandHelperConfig config) model.commandHelperModel commandId (events commandId)
                     |> helperResults model commandId
 
             ValidationError ( commandId, error ) ->
@@ -421,7 +442,7 @@ update config msg model =
             CommandHelperLog logInfo ->
                 childLog "CommandHelper" logInfo
 
-            CommandHelperModule msg ->
+            CommandHelperMsg msg ->
                 updateCommandHelper msg model
 
 
@@ -451,25 +472,13 @@ type alias CommandSuccessTagger msg =
 
 
 {-|
-    Command Processor's Config
--}
-type alias Config customValidationError msg =
-    { routeToMeTagger : RouteToMeTagger customValidationError msg
-    , errorTagger : ErrorTagger ( CommandId, String ) msg
-    , logTagger : LogTagger ( CommandId, String ) msg
-    , commandErrorTagger : CommandErrorTagger customValidationError msg
-    , commandSuccessTagger : CommandSuccessTagger msg
-    }
-
-
-{-|
     Initialize command processor
 -}
 init : Config customValidationError msg -> ( Model customValidationError msg, Cmd msg )
 init config =
     let
         ( model, cmds ) =
-            initModel
+            initModel config
     in
         model ! (List.map (Cmd.map config.routeToMeTagger) cmds)
 
@@ -481,7 +490,7 @@ process : Config customValidationError msg -> DbConnectionInfo -> Maybe (Validat
 process config dbConnectionInfo maybeValidateTagger entityLockAndValidations events model =
     let
         ( commandHelperModel, cmd, commandId ) =
-            CommandHelper.initCommand commandHelperConfig dbConnectionInfo model.commandHelperModel
+            CommandHelper.initCommand (commandHelperConfig config) dbConnectionInfo model.commandHelperModel
 
         commandStates =
             Dict.insert commandId

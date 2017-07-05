@@ -4,6 +4,7 @@ import Platform
 import Time exposing (Time, second)
 import Process
 import Task exposing (Task)
+import Dict exposing (Dict)
 import ParentChildUpdate exposing (..)
 import Slate.Common.Db exposing (..)
 import Slate.Common.Event exposing (..)
@@ -36,11 +37,15 @@ dbConnectionInfo =
 
 commandProcessorConfig : CommandProcessor.Config String Msg
 commandProcessorConfig =
-    { routeToMeTagger = CommandProcessorModule
+    { connectionRetryMax = 3
+    , routeToMeTagger = CommandProcessorMsg
     , errorTagger = CommandProcessorError
     , logTagger = CommandProcessorLog
     , commandErrorTagger = CommandExecutionError
     , commandSuccessTagger = CommandExecutionSuccess
+    , schemaDict = Dict.empty
+    , queryBatchSize = Nothing
+    , debug = True
     }
 
 
@@ -55,7 +60,7 @@ type Msg
     | StartApp
     | CommandProcessorError ( ErrorType, ( CommandId, String ) )
     | CommandProcessorLog ( LogLevel, ( CommandId, String ) )
-    | CommandProcessorModule (CommandProcessor.Msg String)
+    | CommandProcessorMsg (CommandProcessor.Msg String)
     | CommandExecutionError ( CommandId, CommandError String )
     | CommandExecutionSuccess CommandId
     | DummyValidate (CustomValidationErrorTagger String (CommandProcessor.Msg String)) (CustomValidationSuccessTagger (CommandProcessor.Msg String)) CommandId DbConnectionInfo
@@ -105,7 +110,7 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     let
         updateCommandProcessor =
-            ParentChildUpdate.updateChildApp (CommandProcessor.update commandProcessorConfig) update .commandProcessorModel CommandProcessorModule (\model commandProcessorModel -> { model | commandProcessorModel = commandProcessorModel })
+            ParentChildUpdate.updateChildApp (CommandProcessor.update commandProcessorConfig) update .commandProcessorModel CommandProcessorMsg (\model commandProcessorModel -> { model | commandProcessorModel = commandProcessorModel })
     in
         case msg of
             Nop ->
@@ -136,7 +141,7 @@ update msg model =
                         ]
 
                     events =
-                        [ encodeMutatingEvent <| mutating mutatingEventInfo
+                        [ encodeEvent <| mutating mutatingEventInfo
                         ]
 
                     ( commandProcessorModel, cmd, commandId ) =
@@ -177,7 +182,7 @@ update msg model =
                 in
                     model ! []
 
-            CommandProcessorModule msg ->
+            CommandProcessorMsg msg ->
                 updateCommandProcessor msg model
 
             DummyValidate errorTagger successTagger commandId dbConnectionInfo ->
