@@ -221,16 +221,14 @@ update config msg model =
                 ( removeCommand model commandId ! [ Cmd.none ], List.append msgs [ commandFailedMsg commandId originalError ] )
 
         helperFailed model commandId originalError =
-            let
-                ( ( commandHelperModel, cmd ), msgs ) =
-                    CommandHelper.rollback (commandHelperConfig config) model.commandHelperModel commandId
-                        |??> (\( commandHelperModel, cmd ) -> ( { model | commandHelperModel = commandHelperModel } ! [ cmd ], [] ))
-                        ??= (\rollbackError -> rollbackLessFailure model commandId (Just rollbackError) originalError)
-
-                commandState =
-                    getCommandState commandId
-            in
-                ( { model | commandStates = Dict.insert commandId { commandState | commandError = Just originalError } model.commandStates } ! [ cmd ], msgs )
+            Dict.get commandId model.commandStates
+                |?> (\commandState ->
+                        CommandHelper.rollback (commandHelperConfig config) model.commandHelperModel commandId
+                            |??> (\( commandHelperModel, cmd ) -> ( { model | commandHelperModel = commandHelperModel } ! [ cmd ], [] ))
+                            ??= (\rollbackError -> rollbackLessFailure model commandId (Just rollbackError) originalError)
+                            |> (\( ( commandHelperModel, cmd ), msgs ) -> ( { model | commandStates = Dict.insert commandId { commandState | commandError = Just originalError } model.commandStates } ! [ cmd ], msgs ))
+                    )
+                ?= ( model ! [], [ logMsg commandId ("CommandId:" +-+ commandId +-+ "terminated. Unreported error:" +-+ originalError) ] )
 
         helperResults model commandId result =
             let

@@ -1,5 +1,5 @@
 {
-    "version": "2.0.1",
+    "version": "2.0.2",
     "summary": "Slate command processing modules",
     "repository": "https://github.com/elm-slate/command.git",
     "license": "Unlicense",
