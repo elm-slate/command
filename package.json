@@ -1,16 +1,13 @@
 {
-  "name": "slate-command-common",
-  "version": "1.0.0",
+  "name": "@elm-slate/command",
+  "version": "2.0.2",
   "description": "",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Don Gaudino",
   "license": "Unlicense",
-  "dependencies": {
-    "@panosoft/elm-native-helpers": "^0.1.9",
-    "pg": "^6.1.2",
-    "pg-query-stream": "^1.0.0",
-    "stream-read": "^1.1.2"
+"dependencies": {
+    "@panosoft/elm-postgres": "/Users/charles/Documents/workspace/elm/elm-slate/command/elm-stuff/packages/panosoft/elm-postgres/4.2.0"
   }
 }
